@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import tushare as ts
+from lunardate import LunarDate
+from scipy import stats
 
 DEFAULT_NAME_KEYWORDS = [
     "酒店",
@@ -52,28 +54,64 @@ class HolidayEvent:
     gap_days: int
 
 
-def classify_holiday(closure_start: pd.Timestamp, gap_days: int) -> str:
+def build_lunar_festival_dates(start_year: int, end_year: int) -> Dict[str, Dict[int, pd.Timestamp]]:
+    out: Dict[str, Dict[int, pd.Timestamp]] = {"春节": {}, "端午": {}, "中秋": {}}
+    for y in range(start_year - 1, end_year + 2):
+        out["春节"][y] = pd.Timestamp(LunarDate(y, 1, 1).toSolarDate())
+        out["端午"][y] = pd.Timestamp(LunarDate(y, 5, 5).toSolarDate())
+        out["中秋"][y] = pd.Timestamp(LunarDate(y, 8, 15).toSolarDate())
+    return out
+
+
+def classify_holiday(
+    closure_start: pd.Timestamp,
+    closure_end: pd.Timestamp,
+    gap_days: int,
+    lunar_dates: Dict[str, Dict[int, pd.Timestamp]],
+) -> str:
+    y0 = closure_start.year
+    years = [y0 - 1, y0, y0 + 1, closure_end.year]
+
+    cny_dates = [lunar_dates["春节"].get(y) for y in years if lunar_dates["春节"].get(y) is not None]
+    for d in cny_dates:
+        # 春节用“农历正月初一落入休市窗口”判定，避免月度近似误判。
+        if closure_start <= d <= closure_end:
+            return "春节"
+
     m = closure_start.month
     if m == 1 and closure_start.day <= 5 and gap_days <= 5:
         return "元旦"
-    if m in (1, 2):
-        return "春节"
-    if m == 4:
-        return "清明"
-    if m == 5:
-        return "五一"
-    if m == 6:
-        return "端午"
+
     if m in (9, 10):
+        if pd.Timestamp(closure_start.year, 10, 1) <= closure_end and pd.Timestamp(closure_start.year, 10, 1) >= closure_start:
+            return "国庆"
         if gap_days >= 5 or m == 10:
             return "国庆"
-        return "中秋"
+
+    mid_dates = [lunar_dates["中秋"].get(y) for y in years if lunar_dates["中秋"].get(y) is not None]
+    for d in mid_dates:
+        if closure_start <= d <= closure_end:
+            return "中秋"
+
+    duanwu_dates = [lunar_dates["端午"].get(y) for y in years if lunar_dates["端午"].get(y) is not None]
+    for d in duanwu_dates:
+        if closure_start <= d <= closure_end:
+            return "端午"
+
+    may1 = pd.Timestamp(closure_start.year, 5, 1)
+    if closure_start <= may1 <= closure_end:
+        return "五一"
+    qingming_candidates = [pd.Timestamp(closure_start.year, 4, d) for d in (4, 5, 6)]
+    if any(closure_start <= d <= closure_end for d in qingming_candidates):
+        return "清明"
+
     return "其他"
 
 
 def detect_holiday_events(open_trade_dates: pd.DatetimeIndex) -> List[HolidayEvent]:
     events: List[HolidayEvent] = []
     dates = pd.Series(open_trade_dates).sort_values().reset_index(drop=True)
+    lunar_dates = build_lunar_festival_dates(int(dates.iloc[0].year), int(dates.iloc[-1].year))
 
     for i in range(len(dates) - 1):
         prev_day = dates.iloc[i]
@@ -84,7 +122,7 @@ def detect_holiday_events(open_trade_dates: pd.DatetimeIndex) -> List[HolidayEve
 
         closure_start = prev_day + pd.Timedelta(days=1)
         closure_end = next_day - pd.Timedelta(days=1)
-        holiday_type = classify_holiday(closure_start, gap_days)
+        holiday_type = classify_holiday(closure_start, closure_end, gap_days, lunar_dates)
 
         events.append(
             HolidayEvent(
@@ -98,6 +136,22 @@ def detect_holiday_events(open_trade_dates: pd.DatetimeIndex) -> List[HolidayEve
         )
 
     return events
+
+
+def holiday_events_to_df(events: List[HolidayEvent]) -> pd.DataFrame:
+    rows = []
+    for e in events:
+        rows.append(
+            {
+                "holiday_type": e.holiday_type,
+                "pre_trade_date": e.pre_trade_date.date().isoformat(),
+                "post_trade_date": e.post_trade_date.date().isoformat(),
+                "closure_start": e.closure_start.date().isoformat(),
+                "closure_end": e.closure_end.date().isoformat(),
+                "gap_days": e.gap_days,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def fetch_trade_calendar(pro, start_date: str, end_date: str) -> pd.DatetimeIndex:
@@ -199,8 +253,36 @@ def window_cum_return(series: pd.Series) -> float:
     return (np.prod(1 + series / 100.0) - 1) * 100
 
 
+def window_excess_cum_return(stock_series: pd.Series, bench_series: pd.Series) -> float:
+    pair = pd.concat([stock_series.rename("s"), bench_series.rename("b")], axis=1).dropna()
+    if pair.empty:
+        return np.nan
+    s = (np.prod(1 + pair["s"] / 100.0) - 1) * 100
+    b = (np.prod(1 + pair["b"] / 100.0) - 1) * 100
+    return s - b
+
+
+def safe_pearsonr(x: pd.Series, y: pd.Series) -> Tuple[float, float]:
+    pair = pd.concat([x.rename("x"), y.rename("y")], axis=1).dropna()
+    if len(pair) < 5:
+        return np.nan, np.nan
+    if pair["x"].std(ddof=0) == 0 or pair["y"].std(ddof=0) == 0:
+        return np.nan, np.nan
+    corr, pval = stats.pearsonr(pair["x"], pair["y"])
+    return float(corr), float(pval)
+
+
+def safe_ttest_mean_gt0(values: List[float]) -> Tuple[float, float]:
+    arr = np.asarray([v for v in values if not np.isnan(v)], dtype=float)
+    if len(arr) < 3 or np.std(arr, ddof=1) == 0:
+        return np.nan, np.nan
+    tval, p_two = stats.ttest_1samp(arr, 0.0, alternative="greater")
+    return float(tval), float(p_two)
+
+
 def stock_holiday_analysis(
     stock_returns: pd.Series,
+    benchmark_returns: pd.Series,
     trade_days: pd.DatetimeIndex,
     events: List[HolidayEvent],
     pre_window: int = 7,
@@ -212,17 +294,18 @@ def stock_holiday_analysis(
     indicators = build_holiday_indicators(trade_days=trade_days, events=events, pre_window=pre_window)
 
     sr = stock_returns.reindex(days)
+    br = benchmark_returns.reindex(days)
+    er = sr - br
 
     rows = []
     for holiday, ind in indicators.items():
-        pair = pd.concat([sr.rename("ret"), ind.rename("flag")], axis=1).dropna()
-        if len(pair) < 5 or pair["ret"].std(ddof=0) == 0 or pair["flag"].std(ddof=0) == 0:
-            corr = np.nan
-        else:
-            corr = pair["ret"].corr(pair["flag"])
+        corr, corr_pvalue = safe_pearsonr(sr, ind)
+        corr_excess, corr_excess_pvalue = safe_pearsonr(er, ind)
 
         per_event_pre = []
         per_event_post = []
+        per_event_pre_excess = []
+        per_event_post_excess = []
         n_used = 0
 
         for e in events:
@@ -241,6 +324,8 @@ def stock_holiday_analysis(
 
             pre_ret = window_cum_return(sr.reindex(pre_dates).dropna())
             post_ret = window_cum_return(sr.reindex(post_dates).dropna())
+            pre_excess_ret = window_excess_cum_return(sr.reindex(pre_dates), br.reindex(pre_dates))
+            post_excess_ret = window_excess_cum_return(sr.reindex(post_dates), br.reindex(post_dates))
 
             has_data = False
             if not np.isnan(pre_ret):
@@ -249,15 +334,33 @@ def stock_holiday_analysis(
             if not np.isnan(post_ret):
                 per_event_post.append(post_ret)
                 has_data = True
+            if not np.isnan(pre_excess_ret):
+                per_event_pre_excess.append(pre_excess_ret)
+                has_data = True
+            if not np.isnan(post_excess_ret):
+                per_event_post_excess.append(post_excess_ret)
+                has_data = True
             if has_data:
                 n_used += 1
+
+        pre_t_stat, pre_p_gt0 = safe_ttest_mean_gt0(per_event_pre_excess)
+        post_t_stat, post_p_gt0 = safe_ttest_mean_gt0(per_event_post_excess)
 
         rows.append(
             {
                 "holiday": holiday,
                 "corr_pre7_dummy": corr,
+                "corr_pvalue": corr_pvalue,
+                "corr_pre7_dummy_excess": corr_excess,
+                "corr_excess_pvalue": corr_excess_pvalue,
                 "avg_pre7_cum_return_pct": np.nan if not per_event_pre else float(np.mean(per_event_pre)),
                 "avg_post7_cum_return_pct": np.nan if not per_event_post else float(np.mean(per_event_post)),
+                "avg_pre7_excess_cum_return_pct": np.nan if not per_event_pre_excess else float(np.mean(per_event_pre_excess)),
+                "avg_post7_excess_cum_return_pct": np.nan if not per_event_post_excess else float(np.mean(per_event_post_excess)),
+                "pre7_excess_t_stat": pre_t_stat,
+                "pre7_excess_pvalue_gt0": pre_p_gt0,
+                "post7_excess_t_stat": post_t_stat,
+                "post7_excess_pvalue_gt0": post_p_gt0,
                 "events": n_used,
             }
         )
@@ -367,6 +470,12 @@ def export_visual_report(
     summary_vis = summary_df.copy()
     summary_vis.insert(0, "rank", np.arange(1, len(summary_vis) + 1))
     summary_vis["stock_label"] = summary_vis["stock_name"] + "(" + summary_vis["ts_code"] + ")"
+    summary_excess_vis = summary_df.sort_values(
+        ["best_corr_pre7_dummy_excess", "best_pre7_excess_pvalue_gt0", "events"],
+        ascending=[False, True, False],
+    ).copy()
+    summary_excess_vis.insert(0, "rank", np.arange(1, len(summary_excess_vis) + 1))
+    summary_excess_vis["stock_label"] = summary_excess_vis["stock_name"] + "(" + summary_excess_vis["ts_code"] + ")"
 
     detail_vis = all_detail_df.copy()
     if not detail_vis.empty:
@@ -402,6 +511,7 @@ def export_visual_report(
 
         write_df_sheet(writer, "股票池", pool_df)
         write_df_sheet(writer, "总览Top", summary_vis)
+        write_df_sheet(writer, "总览Top_超额", summary_excess_vis)
         write_df_sheet(writer, "个股节假日明细", detail_vis)
         write_df_sheet(writer, "春节逐年", spring_year_df)
         write_df_sheet(writer, "春节路径", spring_avg_path_df)
@@ -411,33 +521,37 @@ def export_visual_report(
         if haoxiangni_detail is not None:
             write_df_sheet(writer, "好想你详情", haoxiangni_detail)
 
-        ws_summary = writer.sheets["总览Top"]
-        n_sum = len(summary_vis)
-        if n_sum > 0:
-            corr_col = summary_vis.columns.get_loc("best_corr_pre7_dummy")
-            pre_col = summary_vis.columns.get_loc("best_avg_pre7_cum_return_pct")
-            post_col = summary_vis.columns.get_loc("best_avg_post7_cum_return_pct")
-            label_col = summary_vis.columns.get_loc("stock_label")
-            evt_col = summary_vis.columns.get_loc("events")
+        for sheet_name, df_now, corr_col_name in [
+            ("总览Top", summary_vis, "best_corr_pre7_dummy"),
+            ("总览Top_超额", summary_excess_vis, "best_corr_pre7_dummy_excess"),
+        ]:
+            ws_summary = writer.sheets[sheet_name]
+            n_sum = len(df_now)
+            if n_sum > 0:
+                corr_col = df_now.columns.get_loc(corr_col_name)
+                pre_col = df_now.columns.get_loc("best_avg_pre7_cum_return_pct")
+                post_col = df_now.columns.get_loc("best_avg_post7_cum_return_pct")
+                label_col = df_now.columns.get_loc("stock_label")
+                evt_col = df_now.columns.get_loc("events")
 
-            ws_summary.conditional_format(1, corr_col, n_sum, corr_col, {"type": "3_color_scale"})
-            ws_summary.conditional_format(1, pre_col, n_sum, pre_col, {"type": "3_color_scale"})
-            ws_summary.conditional_format(1, post_col, n_sum, post_col, {"type": "3_color_scale"})
-            ws_summary.conditional_format(1, evt_col, n_sum, evt_col, {"type": "data_bar"})
+                ws_summary.conditional_format(1, corr_col, n_sum, corr_col, {"type": "3_color_scale"})
+                ws_summary.conditional_format(1, pre_col, n_sum, pre_col, {"type": "3_color_scale"})
+                ws_summary.conditional_format(1, post_col, n_sum, post_col, {"type": "3_color_scale"})
+                ws_summary.conditional_format(1, evt_col, n_sum, evt_col, {"type": "data_bar"})
 
-            top_n = min(20, n_sum)
-            chart = workbook.add_chart({"type": "column"})
-            chart.add_series(
-                {
-                    "name": "节前7日相关系数",
-                    "categories": ["总览Top", 1, label_col, top_n, label_col],
-                    "values": ["总览Top", 1, corr_col, top_n, corr_col],
-                }
-            )
-            chart.set_title({"name": "相关性Top20"})
-            chart.set_legend({"none": True})
-            chart.set_y_axis({"name": "corr"})
-            ws_summary.insert_chart(1, len(summary_vis.columns) + 1, chart, {"x_scale": 1.5, "y_scale": 1.2})
+                top_n = min(20, n_sum)
+                chart = workbook.add_chart({"type": "column"})
+                chart.add_series(
+                    {
+                        "name": "节前7日相关系数",
+                        "categories": [sheet_name, 1, label_col, top_n, label_col],
+                        "values": [sheet_name, 1, corr_col, top_n, corr_col],
+                    }
+                )
+                chart.set_title({"name": f"{sheet_name} Top20"})
+                chart.set_legend({"none": True})
+                chart.set_y_axis({"name": "corr"})
+                ws_summary.insert_chart(1, len(df_now.columns) + 1, chart, {"x_scale": 1.5, "y_scale": 1.2})
 
         ws_detail = writer.sheets["个股节假日明细"]
         n_det = len(detail_vis)
@@ -538,9 +652,12 @@ def export_markdown_report(
             all_detail_df.groupby("holiday", as_index=False)
             .agg(
                 mean_corr=("corr_pre7_dummy", "mean"),
+                mean_corr_excess=("corr_pre7_dummy_excess", "mean"),
                 median_corr=("corr_pre7_dummy", "median"),
                 mean_pre7=("avg_pre7_cum_return_pct", "mean"),
                 mean_post7=("avg_post7_cum_return_pct", "mean"),
+                mean_pre7_excess=("avg_pre7_excess_cum_return_pct", "mean"),
+                mean_post7_excess=("avg_post7_excess_cum_return_pct", "mean"),
                 stocks=("ts_code", "nunique"),
             )
             .sort_values("mean_corr", ascending=False)
@@ -551,15 +668,27 @@ def export_markdown_report(
         "stock_name",
         "best_holiday",
         "best_corr_pre7_dummy",
+        "best_corr_pvalue",
+        "best_corr_pre7_dummy_excess",
+        "best_corr_excess_pvalue",
         "best_avg_pre7_cum_return_pct",
         "best_avg_post7_cum_return_pct",
+        "best_avg_pre7_excess_cum_return_pct",
+        "best_avg_post7_excess_cum_return_pct",
+        "best_pre7_excess_pvalue_gt0",
         "events",
     ]
     hx_cols = [
         "holiday",
         "corr_pre7_dummy",
+        "corr_pvalue",
+        "corr_pre7_dummy_excess",
+        "corr_excess_pvalue",
         "avg_pre7_cum_return_pct",
         "avg_post7_cum_return_pct",
+        "avg_pre7_excess_cum_return_pct",
+        "avg_post7_excess_cum_return_pct",
+        "pre7_excess_pvalue_gt0",
         "events",
     ]
 
@@ -570,6 +699,7 @@ def export_markdown_report(
     lines.append(f"- 数据源: TuShare 日线行情 (`pro.daily`, `pro.index_daily`, `pro.trade_cal`)")
     lines.append(f"- 区间: `{start_date}` - `{end_date}`")
     lines.append("- 标的范围: 自动筛选酒店/旅游/餐饮/食品/饮料/酒类等相关个股（含`好想你`）")
+    lines.append("- 春节识别: 按每年农历正月初一落入的实际休市窗口判定（非固定公历日期）")
     lines.append(f"- 股票池数量: `{len(pool_df)}`")
     lines.append(f"- 成功分析数量: `{len(summary_df)}`")
     lines.append("")
@@ -604,7 +734,9 @@ def export_markdown_report(
     lines.append("")
     lines.append("## 7. 文件清单")
     lines.append("- `thematic_stock_pool.csv`: 自动筛选的股票池")
+    lines.append("- `holiday_event_calendar.csv`: 休市窗口与节日判定明细（含春节窗口）")
     lines.append("- `holiday_correlation_summary.csv`: 每只股票最强节假日汇总")
+    lines.append("- `holiday_correlation_summary_excess_rank.csv`: 按超额相关性排序的汇总")
     lines.append("- `all_stocks_holiday_detail.csv`: 每只股票 x 每个节假日完整明细")
     lines.append("- `haoxiangni_holiday_detail.csv`: 好想你明细")
     lines.append("- `spring_festival_index_7d_by_year.csv`: 春节逐年统计")
@@ -670,6 +802,11 @@ def main() -> None:
 
     trade_days = fetch_trade_calendar(pro, args.start, args.end)
     events = detect_holiday_events(trade_days)
+    event_df = holiday_events_to_df(events)
+    event_path = os.path.join(args.outdir, "holiday_event_calendar.csv")
+    event_df.to_csv(event_path, index=False, encoding="utf-8-sig")
+    idx_df = fetch_daily_pct_chg(pro, "000001.SH", args.start, args.end, is_index=True)
+    idx_ret = idx_df.set_index("trade_date")["pct_chg"]
 
     all_rows = []
     all_detail_rows = []
@@ -685,7 +822,7 @@ def main() -> None:
             continue
         ret = df.set_index("trade_date")["pct_chg"]
 
-        detail = stock_holiday_analysis(ret, trade_days, events, pre_window=7, post_window=7)
+        detail = stock_holiday_analysis(ret, idx_ret, trade_days, events, pre_window=7, post_window=7)
         detail = detail[detail["events"] > 0].copy()
         if detail.empty:
             continue
@@ -704,8 +841,14 @@ def main() -> None:
                 "stock_name": name,
                 "best_holiday": best["holiday"],
                 "best_corr_pre7_dummy": best["corr_pre7_dummy"],
+                "best_corr_pvalue": best["corr_pvalue"],
+                "best_corr_pre7_dummy_excess": best["corr_pre7_dummy_excess"],
+                "best_corr_excess_pvalue": best["corr_excess_pvalue"],
                 "best_avg_pre7_cum_return_pct": best["avg_pre7_cum_return_pct"],
                 "best_avg_post7_cum_return_pct": best["avg_post7_cum_return_pct"],
+                "best_avg_pre7_excess_cum_return_pct": best["avg_pre7_excess_cum_return_pct"],
+                "best_avg_post7_excess_cum_return_pct": best["avg_post7_excess_cum_return_pct"],
+                "best_pre7_excess_pvalue_gt0": best["pre7_excess_pvalue_gt0"],
                 "events": int(best["events"]),
             }
         )
@@ -720,6 +863,12 @@ def main() -> None:
     summary_df = summary_df.sort_values("best_corr_pre7_dummy", ascending=False)
     summary_path = os.path.join(args.outdir, "holiday_correlation_summary.csv")
     summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
+    summary_excess = summary_df.sort_values(
+        ["best_corr_pre7_dummy_excess", "best_pre7_excess_pvalue_gt0", "events"],
+        ascending=[False, True, False],
+    )
+    summary_excess_path = os.path.join(args.outdir, "holiday_correlation_summary_excess_rank.csv")
+    summary_excess.to_csv(summary_excess_path, index=False, encoding="utf-8-sig")
 
     all_detail_df = pd.DataFrame()
     if all_detail_rows:
@@ -729,9 +878,6 @@ def main() -> None:
     if haoxiangni_detail is not None:
         hx_path = os.path.join(args.outdir, "haoxiangni_holiday_detail.csv")
         haoxiangni_detail.to_csv(hx_path, index=False, encoding="utf-8-sig")
-
-    idx_df = fetch_daily_pct_chg(pro, "000001.SH", args.start, args.end, is_index=True)
-    idx_ret = idx_df.set_index("trade_date")["pct_chg"]
 
     spring_year_df, spring_avg_path_df = spring_festival_index_analysis(idx_ret, trade_days, events, pre_window=7, post_window=7)
 
@@ -763,7 +909,9 @@ def main() -> None:
 
     print("=== 输出文件 ===")
     print(pool_path)
+    print(event_path)
     print(summary_path)
+    print(summary_excess_path)
     print(os.path.join(args.outdir, "haoxiangni_holiday_detail.csv"))
     print(spring_year_path)
     print(spring_avg_path)
